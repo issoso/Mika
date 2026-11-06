@@ -1,0 +1,180 @@
+package com.wangzan101.mika.voice
+
+import com.wangzan101.mika.core.model.ListedModel
+import com.wangzan101.mika.core.model.ModelError
+import com.wangzan101.mika.core.model.ModelHttp
+import com.wangzan101.mika.settings.Provider
+import com.wangzan101.mika.settings.ProviderConfig
+import kotlinx.serialization.json.Json
+import kotlinx.serialization.json.JsonArray
+import kotlinx.serialization.json.JsonObject
+import kotlinx.serialization.json.JsonPrimitive
+import kotlinx.serialization.json.buildJsonArray
+import kotlinx.serialization.json.buildJsonObject
+import kotlinx.serialization.json.contentOrNull
+import kotlinx.serialization.json.put
+import kotlinx.serialization.json.putJsonObject
+import okhttp3.MediaType.Companion.toMediaType
+import okhttp3.MultipartBody
+import okhttp3.OkHttpClient
+import okhttp3.Request
+import okhttp3.RequestBody.Companion.toRequestBody
+import java.util.Base64
+
+/**
+ * 用服务商的模型把一段录音转成文字,接口形态见 [TranscribeMethod]。
+ * 报错和对话模型走同一套映射([ModelHttp]),界面可以直接复用现有的说法;只按协议发请求,不按模型名特判。
+ * [headers] 是每个请求都带的头(客户端标识等,见 ClientHeaders),Key 的头由这里按接口类型加。
+ */
+class Transcriber(
+    private val http: OkHttpClient,
+    private val headers: Map<String, String> = emptyMap(),
+) {
+    private val json = Json { ignoreUnknownKeys = true }
+
+    /** 转一段 WAV;失败抛 [ModelError](和对话模型同一套)。返回的文字可能是空串(没听到话)。 */
+    suspend fun transcribe(
+        p: Provider, key: String?, model: String, method: TranscribeMethod, wav: ByteArray, language: String?,
+    ): String {
+        val base = p.baseUrl.trim().trimEnd('/')
+        val gemini = p.kind == ProviderConfig.Kind.Gemini
+        val request = when (method) {
+            TranscribeMethod.AudioTranscriptions -> {
+                val body = MultipartBody.Builder().setType(MultipartBody.FORM)
+                    .addFormDataPart("file", "audio.wav", wav.toRequestBody("audio/wav".toMediaType()))
+                    .addFormDataPart("model", model)
+                    .apply { if (!language.isNullOrBlank()) addFormDataPart("language", language) }
+                    .build()
+                builder("$base/audio/transcriptions", key, gemini).post(body).build()
+            }
+            TranscribeMethod.ChatInputAudio, TranscribeMethod.ChatInputAudioUri, TranscribeMethod.ChatInputAudioOnly -> {
+                val data = if (method == TranscribeMethod.ChatInputAudio) base64(wav) else "data:audio/wav;base64,${base64(wav)}"
+                val payload = buildJsonObject {
+                    put("model", model)
+                    put("stream", false)
+                    put("messages", buildJsonArray {
+                        add(buildJsonObject {
+                            put("role", "user")
+                            put("content", buildJsonArray {
+                                add(buildJsonObject {
+                                    put("type", "input_audio")
+                                    putJsonObject("input_audio") { put("data", data); put("format", "wav") }
+                                })
+                                // 专做转写的模型不收文字块;通用模型没有这句指令会当成聊天回话
+                                if (method != TranscribeMethod.ChatInputAudioOnly) {
+                                    add(buildJsonObject { put("type", "text"); put("text", INSTRUCTION) })
+                                }
+                            })
+                        })
+                    })
+                }
+                builder("$base/chat/completions", key, gemini).post(payload.toString().toRequestBody(JSON)).build()
+            }
+            TranscribeMethod.GeminiInline -> {
+                val payload = buildJsonObject {
+                    put("contents", buildJsonArray {
+                        add(buildJsonObject {
+                            put("parts", buildJsonArray {
+                                add(buildJsonObject {
+                                    putJsonObject("inline_data") { put("mime_type", "audio/wav"); put("data", base64(wav)) }
+                                })
+                                add(buildJsonObject { put("text", INSTRUCTION) })
+                            })
+                        })
+                    })
+                }
+                // 和对话适配器一样:库存的地址不带 /v1beta,这里补上
+                builder("$base/v1beta/models/$model:generateContent", key, gemini).post(payload.toString().toRequestBody(JSON)).build()
+            }
+        }
+        val reply = ModelHttp.send(http, request)
+        if (!reply.ok) {
+            throw if (gemini) ModelHttp.geminiError(reply.status, reply.retryAfter, reply.body, model)
+            else ModelHttp.openAiError(reply.status, reply.retryAfter, reply.body, model)
+        }
+        return parse(method, reply.body)
+    }
+
+    /**
+     * 选模型时试转:按接口类型依次试,返回第一个通过的;都不行抛最后一个错误。
+     * 通过 = 回 2xx 且解析得出文字字段(空串也算)。Key 的问题(401/403/额度)再试别的方法也没用,直接抛。
+     */
+    suspend fun detect(p: Provider, key: String?, model: String): TranscribeMethod {
+        val order = if (p.kind == ProviderConfig.Kind.Gemini) listOf(TranscribeMethod.GeminiInline)
+        // 只发音频不带指令的放最后:通用模型也会回 2xx(把录音当聊天回一段话),排在前面会被误选
+        else listOf(
+            TranscribeMethod.AudioTranscriptions, TranscribeMethod.ChatInputAudio,
+            TranscribeMethod.ChatInputAudioUri, TranscribeMethod.ChatInputAudioOnly,
+        )
+        val wav = Wav.silence(1000)
+        var last: ModelError? = null
+        for (method in order) {
+            try {
+                transcribe(p, key, model, method, wav, null)
+                return method
+            } catch (e: ModelError) {
+                last = e
+                if (!triesNext(e)) throw e
+            }
+        }
+        throw last ?: ModelError.BadResponse("no method")
+    }
+
+    /** 只有「这个接口不是这么用的」(找不到路径、方法不对、请求不合、回的不是这个格式)才换下一种。 */
+    private fun triesNext(e: ModelError): Boolean = e is ModelError.ModelNotFound || e is ModelError.BadResponse
+
+    private fun builder(url: String, key: String?, gemini: Boolean): Request.Builder = Request.Builder().url(url).apply {
+        headers.forEach { (k, v) -> header(k, v) }
+        if (!key.isNullOrEmpty()) { if (gemini) header("x-goog-api-key", key) else header("Authorization", "Bearer $key") }
+    }
+
+    private fun parse(method: TranscribeMethod, body: String): String {
+        val root = try { json.parseToJsonElement(body) as? JsonObject } catch (e: Exception) { null }
+            ?: throw ModelError.BadResponse("not json: ${body.take(120)}")
+        val text = when (method) {
+            TranscribeMethod.AudioTranscriptions -> root.str("text")
+            TranscribeMethod.ChatInputAudio, TranscribeMethod.ChatInputAudioUri, TranscribeMethod.ChatInputAudioOnly -> {
+                val msg = ((root["choices"] as? JsonArray)?.firstOrNull() as? JsonObject)?.get("message") as? JsonObject
+                when (val c = msg?.get("content")) {
+                    is JsonPrimitive -> c.contentOrNull
+                    // 内容是分块数组的:把文字块拼起来
+                    is JsonArray -> c.mapNotNull { (it as? JsonObject)?.str("text") }.joinToString("")
+                    else -> null
+                }
+            }
+            TranscribeMethod.GeminiInline -> {
+                val cand = (root["candidates"] as? JsonArray)?.firstOrNull() as? JsonObject
+                val parts = (cand?.get("content") as? JsonObject)?.get("parts") as? JsonArray
+                // 没有任何文字块(比如静音时只回结束原因)按空串;连候选都没有才算格式不对
+                if (cand == null) null else parts.orEmpty().mapNotNull { (it as? JsonObject)?.str("text") }.joinToString("")
+            }
+        }
+        return (text ?: throw ModelError.BadResponse("no text field: ${body.take(120)}")).trim()
+    }
+
+    private fun JsonObject.str(k: String): String? = (this[k] as? JsonPrimitive)?.takeIf { it.isString }?.contentOrNull
+
+    private fun base64(b: ByteArray): String = Base64.getEncoder().encodeToString(b)
+
+    companion object {
+        private val JSON = "application/json".toMediaType()
+
+        /** 发给模型的指令:只要原话,不要解释(模型面向英文)。 */
+        private const val INSTRUCTION = "Transcribe this recording word for word. Output only the transcript text."
+
+        private val SPEECH_TOKENS = listOf("asr", "transcribe", "whisper", "paraformer", "sensevoice", "stt", "speech")
+
+        /** 这家能不能做语音转文字:有 Key 的 OpenAI 兼容、Responses、Gemini 可以;Anthropic 和账号登录的不行。 */
+        fun supports(p: Provider): Boolean = when (p.kind) {
+            ProviderConfig.Kind.OpenAiCompat, ProviderConfig.Kind.OpenAiResponses, ProviderConfig.Kind.Gemini -> p.signIn == null
+            else -> false
+        }
+
+        /**
+         * 列表里像语音模型的:名字按非字母数字切成段,有一段以 asr、transcribe、whisper 等开头。
+         * 模型列表只标了「是不是对话模型」,没有单独的语音标记,所以只能看名字。
+         */
+        fun looksLikeSpeech(m: ListedModel): Boolean =
+            m.id.lowercase().split(Regex("[^a-z0-9]+")).any { seg -> SPEECH_TOKENS.any { seg.startsWith(it) } }
+    }
+}
