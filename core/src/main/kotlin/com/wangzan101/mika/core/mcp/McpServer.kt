@@ -40,12 +40,16 @@ class McpToolSession internal constructor(
     private val store: RunStore,
     approvals: ApprovalSettings,
     private val clock: () -> Long,
+    allowedTools: Set<String>? = null,
 ) {
     val events = RunEventBus()
     private val lock = Mutex()
     private var step = 0
     private var closed = false
-    private val offered = tools.definitions().map { it.name }.toSet()
+    private val definitions = tools.definitions().let { all ->
+        if (allowedTools == null) all else all.filter { it.name in allowedTools }
+    }
+    private val offered = definitions.map { it.name }.toSet()
     private val executor = ActionExecutor(tools, OperationGuards(), null, gate = {},
         recorder = ActionRecorder(events, clock), offScreen = tools.offScreenGuard(), approvals = approvals,
         provenance = spec.provenance, autonomous = true)
@@ -55,7 +59,9 @@ class McpToolSession internal constructor(
         events.event(RunEvent.State(clock(), "mcp_session_started", spec.id.value))
     }
 
-    fun tools() = tools.definitions()
+    val isClosed: Boolean get() = closed
+
+    fun tools() = definitions
 
     suspend fun call(name: String, argumentsJson: String): JsonObject = lock.withLock {
         if (closed) return@withLock error("session_closed")
@@ -85,10 +91,14 @@ class McpServer(
     private val approvals: ApprovalSettings = ApprovalSettings.ASK,
     private val clock: () -> Long = System::currentTimeMillis,
 ) {
-    fun openToolSession(threadId: String, attendance: Attendance = Attendance.Unattended): McpToolSession {
+    fun openToolSession(
+        threadId: String,
+        attendance: Attendance = Attendance.Unattended,
+        allowedTools: Set<String>? = null,
+    ): McpToolSession {
         val spec = RunSpec(RunId(UUID.randomUUID().toString()), "MCP tool session", threadId,
             provenance = RunProvenance(RunOrigin.Mcp, attendance))
-        return McpToolSession(spec, assemble(spec), store, approvals, clock)
+        return McpToolSession(spec, assemble(spec), store, approvals, clock, allowedTools)
     }
 
     fun submitTask(goal: String, threadId: String, attendance: Attendance = Attendance.Unattended): McpTaskLink {
