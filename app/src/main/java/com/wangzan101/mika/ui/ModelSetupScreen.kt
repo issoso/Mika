@@ -681,7 +681,7 @@ object ModelSetupCopy {
             ProviderConfig.Kind.Anthropic -> R.string.model_example_anthropic
             ProviderConfig.Kind.OpenAiResponses, ProviderConfig.Kind.ChatGpt -> R.string.model_example_openai
             ProviderConfig.Kind.Xai -> R.string.model_example_grok
-            ProviderConfig.Kind.OpenAiCompat -> R.string.model_example_compat
+            ProviderConfig.Kind.OpenAiCompat, ProviderConfig.Kind.Muse -> R.string.model_example_compat
         },
     )
 

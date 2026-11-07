@@ -2,14 +2,18 @@ package com.wangzan101.mika.settings
 
 import com.wangzan101.mika.core.model.Capabilities
 import com.wangzan101.mika.core.model.ChatModel
+import com.wangzan101.mika.core.model.ListFailure
 import com.wangzan101.mika.core.model.ListedModel
 import com.wangzan101.mika.core.model.Message
 import com.wangzan101.mika.core.model.ModelError
 import com.wangzan101.mika.core.model.ModelEndpoint
+import com.wangzan101.mika.core.model.ModelListResult
 import com.wangzan101.mika.core.model.ModelProtocol
 import com.wangzan101.mika.core.model.ModelReply
 import com.wangzan101.mika.core.model.ModelRole
 import com.wangzan101.mika.core.model.ModelSession
+import com.wangzan101.mika.core.model.MuseModel
+import com.wangzan101.mika.core.model.Part
 import com.wangzan101.mika.core.model.StopReason
 import com.wangzan101.mika.core.model.ToolSpec
 import com.wangzan101.mika.core.model.Usage
@@ -930,6 +934,57 @@ class ProviderStoreTest {
             val body = server.takeRequest().body.readUtf8()
             assertTrue(body, body.contains("\"max_tokens\":1024"))
             assertTrue(body.contains("get_time"))
+        } finally {
+            server.shutdown()
+        }
+    }
+
+    /** Kind.Muse 建出 MuseModel 并经 MCP 调用 muse_complete;listAvailable 返回 NotSupported。 */
+    @Test
+    fun museKindBuildsMuseModelAndCallsMuseComplete() = runTest {
+        val server = MockWebServer().also { it.start() }
+        try {
+            val s = ProviderStore(tmp.root, AesGcmKeyCipher { key }, userAgent = "Mika/1.2.3")
+            val mcpUrl = server.url("/mcp").toString()
+            assertEquals(
+                ModelListResult.Failed(ListFailure.NotSupported),
+                s.listModels(ProviderConfig.Kind.Muse, mcpUrl, "muse-token"),
+            )
+            val musePreset = ProviderPresets.all.single { it.kind == ProviderConfig.Kind.Muse }
+            val p = s.connect(musePreset.label, ProviderConfig.Kind.Muse, mcpUrl, "muse-token", emptyList())
+            assertTrue(s.use(ModelRole.Main, p.id, "muse", musePreset.capabilities))
+
+            val model = s.modelFor(ModelRole.Main)!!
+            val delegateField = model.javaClass.declaredFields.firstOrNull { ChatModel::class.java.isAssignableFrom(it.type) }
+            if (delegateField != null) {
+                delegateField.isAccessible = true
+                assertTrue(delegateField.get(model) is MuseModel)
+            }
+
+            server.enqueue(
+                MockResponse().setResponseCode(200).setHeader("Content-Type", "application/json").setBody(
+                    """{"jsonrpc":"2.0","id":1,"result":{"protocolVersion":"2025-03-26","capabilities":{"tools":{}},"serverInfo":{"name":"muse","version":"0.1.0"}}}""",
+                ),
+            )
+            server.enqueue(MockResponse().setResponseCode(202).setBody(""))
+            server.enqueue(
+                MockResponse().setResponseCode(200).setHeader("Content-Type", "application/json").setBody(
+                    """{"jsonrpc":"2.0","id":2,"result":{"content":[{"type":"text","text":"{\"parts\":[{\"type\":\"text\",\"text\":\"hello from muse\"}],\"stopReason\":\"EndTurn\",\"usage\":{\"inputTokens\":5,\"outputTokens\":3}}"}],"isError":false}}""",
+                ),
+            )
+
+            val reply = model.complete("sys", emptyList(), emptyList())
+            assertEquals(listOf(Part.Text("hello from muse")), reply.parts)
+            assertEquals(StopReason.EndTurn, reply.stopReason)
+            assertEquals(Usage(5, 3), reply.usage)
+
+            val initReq = server.takeRequest()
+            assertEquals("Bearer muse-token", initReq.getHeader("Authorization"))
+            server.takeRequest() // notifications/initialized
+            val callReq = server.takeRequest()
+            val callBody = callReq.body.readUtf8()
+            assertTrue(callBody, callBody.contains("\"name\":\"muse_complete\""))
+            assertTrue(callBody, callBody.contains("\"model\":\"muse\""))
         } finally {
             server.shutdown()
         }

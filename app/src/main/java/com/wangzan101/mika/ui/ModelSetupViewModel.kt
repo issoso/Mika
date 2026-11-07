@@ -133,7 +133,7 @@ data class AddForm(
     val isSelfHosted: Boolean get() = presetFor(preset).selfHosted
 
     /** 地址要用户填或改:自定义,和自己跑的服务。 */
-    val urlEditable: Boolean get() = isCustom || isSelfHosted
+    val urlEditable: Boolean get() = isCustom || isSelfHosted || kind == ProviderConfig.Kind.Muse
 
     val urlProblem: String?
         get() = when {
@@ -146,8 +146,8 @@ data class AddForm(
     val unencryptedWarning: String?
         get() = if (urlProblem == null && LocalHosts.unencryptedRemote(baseUrl)) tr(R.string.model_url_unencrypted) else null
 
-    /** 自己跑的服务和自定义的 OpenAI 兼容接口(多半是本地服务)可以不填 Key,其余都要。 */
-    val keyRequired: Boolean get() = !isSelfHosted && !(isCustom && kind == ProviderConfig.Kind.OpenAiCompat)
+    /** 自己跑的服务和自定义的 OpenAI 兼容或 Muse 接口可以不填 Key,其余都要。 */
+    val keyRequired: Boolean get() = !isSelfHosted && kind != ProviderConfig.Kind.Muse && !(isCustom && kind == ProviderConfig.Kind.OpenAiCompat)
 
     val canTest: Boolean get() =
         urlProblem == null && (!keyRequired || apiKey.isNotBlank()) && test != ListState.Running && (!noList || model.isNotBlank())
@@ -181,7 +181,15 @@ data class AddForm(
     val familyTokens: List<String> get() = presetFor(preset).familyTokens.ifEmpty { ModelOptions.familyOf(baseUrl) }
 
     companion object {
-        fun of(p: ProviderPreset) = AddForm(p.label, p.kind, p.baseUrl, "")
+        const val DEFAULT_MUSE_MODEL = "muse"
+        fun of(p: ProviderPreset) = AddForm(
+            preset = p.label,
+            kind = p.kind,
+            baseUrl = p.baseUrl,
+            apiKey = "",
+            model = if (p.kind == ProviderConfig.Kind.Muse) DEFAULT_MUSE_MODEL else "",
+            noList = p.kind == ProviderConfig.Kind.Muse,
+        )
         fun presetFor(label: String): ProviderPreset = ProviderPresets.all.firstOrNull { it.label == label } ?: ProviderPresets.custom
     }
 }
@@ -418,9 +426,16 @@ class ModelSetupViewModel(
         edit { AddForm.of(p).copy(apiKey = key) }
     }
 
-    // 换了接口类型或地址,上次「没列出模型」就不作数了,要重新列
-    fun setKind(kind: ProviderConfig.Kind) = edit { it.copy(kind = kind, noList = false) }
-    fun setBaseUrl(url: String) = edit { it.copy(baseUrl = url, noList = false) }
+    // 换了接口类型或地址,上次「没列出模型」就不作数了(Muse 本身就没有列表接口,保持手填状态和默认名 "muse")
+    fun setKind(kind: ProviderConfig.Kind) = edit {
+        val muse = kind == ProviderConfig.Kind.Muse
+        it.copy(
+            kind = kind,
+            noList = muse,
+            model = if (muse && it.model.isBlank()) AddForm.DEFAULT_MUSE_MODEL else it.model,
+        )
+    }
+    fun setBaseUrl(url: String) = edit { it.copy(baseUrl = url, noList = it.kind == ProviderConfig.Kind.Muse) }
     fun setApiKey(key: String) = edit { it.copy(apiKey = key) }
     fun setModel(model: String) = edit { it.copy(model = model) }
 
@@ -480,7 +495,11 @@ class ModelSetupViewModel(
             // 手填了模型名:只试这一个,列表(有的话)照样存下
             if (typed.isNotEmpty()) {
                 val listed = models.firstOrNull { it.id == typed }
-                val base = (ProviderPresets.forBaseUrl(baseUrl) ?: ProviderPresets.custom).capabilities
+                val base = when {
+                    f.kind == ProviderConfig.Kind.Muse ->
+                        ProviderPresets.all.firstOrNull { it.kind == ProviderConfig.Kind.Muse }?.capabilities ?: ProviderPresets.custom.capabilities
+                    else -> (ProviderPresets.forBaseUrl(baseUrl) ?: ProviderPresets.custom).capabilities
+                }
                 val caps = listed?.let { ModelOptions.merge(listOf(it), base).firstOrNull()?.capabilities } ?: base
                 val outcome = probeModel(
                     f.kind, baseUrl, key.ifEmpty { null }, f.sessionHeader, typed, listed?.endpoint, caps, f.exampleKind,

@@ -27,6 +27,7 @@ import com.wangzan101.mika.core.model.ModelListResult
 import com.wangzan101.mika.core.model.ModelProtocol
 import com.wangzan101.mika.core.model.ModelRole
 import com.wangzan101.mika.core.model.ModelSession
+import com.wangzan101.mika.core.model.MuseModel
 import com.wangzan101.mika.core.model.OpenAiCompatModel
 import com.wangzan101.mika.core.model.Part
 import com.wangzan101.mika.core.model.PromptCaching
@@ -83,9 +84,10 @@ data class ProviderConfig(
      * 接口类型。[OpenAiResponses] 用在模型列表给某个模型写明 Responses 协议时、预设「OpenAI」,以及添加自定义服务商时选了它;
      * [ChatGpt] 是用 ChatGPT 账号登录、用套餐额度调用的那一家:凭据是登录(见 [ChatGptSession]),不是 API Key。
      * [Xai] 同样是账号登录(设备码),凭据是登录不是 API Key,调用 xAI 自己的 Responses 接口。
+     * [Muse] 通过 MCP Streamable HTTP 调用远端 `muse_complete` 工具作为大脑。
      */
     enum class Kind {
-        OpenAiCompat, Anthropic, Gemini, OpenAiResponses, ChatGpt, Xai;
+        OpenAiCompat, Anthropic, Gemini, OpenAiResponses, ChatGpt, Xai, Muse;
 
         /**
          * 这个接口类型发请求走哪种协议。用它筛掉接口写明了不支持的模型,见 [com.wangzan101.mika.ui.ModelSetupViewModel]
@@ -94,7 +96,7 @@ data class ProviderConfig(
          */
         val protocol: ModelProtocol
             get() = when (this) {
-                OpenAiCompat -> ModelProtocol.ChatCompletions
+                OpenAiCompat, Muse -> ModelProtocol.ChatCompletions
                 Anthropic -> ModelProtocol.Messages
                 Gemini -> ModelProtocol.GenerateContent
                 OpenAiResponses, ChatGpt, Xai -> ModelProtocol.Responses
@@ -110,7 +112,7 @@ data class ProviderConfig(
             }
 
             /** 添加自定义服务商时可选的接口类型(填地址和 API Key 的)。Responses 排最后,和 README 里的次序一致。 */
-            val withApiKey: List<Kind> = listOf(OpenAiCompat, Anthropic, Gemini, OpenAiResponses)
+            val withApiKey: List<Kind> = listOf(OpenAiCompat, Anthropic, Gemini, OpenAiResponses, Muse)
         }
     }
 }
@@ -820,6 +822,8 @@ class ProviderStore(
             ProviderConfig.Kind.Xai ->
                 ResponsesModel(baseUrl, accountTokensFor(cfg.providerId), cfg.model, cfg.capabilities, http, headers = setup.headers,
                     reasoningEffort = setup.reasoningEffort, accountLogin = XAI_ACCOUNT)
+            ProviderConfig.Kind.Muse ->
+                MuseModel(baseUrl, apiKey, cfg.model, cfg.capabilities, http)
         }
     }
 
@@ -1175,7 +1179,7 @@ class ProviderStore(
 
         /**
          * 列模型的接口:OpenAI 兼容、Responses、ChatGPT 和 xAI 都是 `GET {base}/models`(Bearer;订阅登录的 [apiKey] 是访问令牌)。
-         * [headers] 每个请求都带(见 [ClientHeaders])。
+         * [headers] 每个请求都带(见 [ClientHeaders])。Muse 没有列模型接口。
          */
         suspend fun listAvailable(kind: ProviderConfig.Kind, baseUrl: String, apiKey: String?, headers: Map<String, String>): ModelListResult =
             when (kind) {
@@ -1183,6 +1187,7 @@ class ProviderStore(
                     catalog.openAiCompat(baseUrl, apiKey, headers)
                 ProviderConfig.Kind.Anthropic -> catalog.anthropic(baseUrl, apiKey.orEmpty(), headers)
                 ProviderConfig.Kind.Gemini -> catalog.gemini(baseUrl, apiKey.orEmpty(), headers)
+                ProviderConfig.Kind.Muse -> ModelListResult.Failed(ListFailure.NotSupported)
             }
 
         /**

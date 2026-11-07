@@ -102,8 +102,11 @@ object ModelOptions {
      */
     fun seesImages(stored: Boolean, userSaid: Boolean?, usedForVision: Boolean): Boolean = userSaid ?: (usedForVision || stored)
 
-    /** 服务商的能力初值:地址对得上预设的用预设的,否则用「自定义」的。 */
-    fun baseOf(p: Provider): Capabilities = (ProviderPresets.forBaseUrl(p.baseUrl) ?: ProviderPresets.custom).capabilities
+    /** 服务商的能力初值:地址对得上预设的用预设的,Muse 用 Muse 预设的,否则用「自定义」的。 */
+    fun baseOf(p: Provider): Capabilities =
+        (ProviderPresets.forBaseUrl(p.baseUrl)
+            ?: ProviderPresets.all.firstOrNull { p.kind == ProviderConfig.Kind.Muse && it.kind == ProviderConfig.Kind.Muse }
+            ?: ProviderPresets.custom).capabilities
 
     /**
      * 一个服务商可选的全部模型:记住的列表(合并能力初值;已有配置的用配置里的能力),

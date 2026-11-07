@@ -39,7 +39,12 @@ sealed class ModelError(message: String, cause: Throwable? = null) : Exception(m
      * 回复不完整、不能用,重发同一个请求通常就好;和接口配置无关。
      */
     class StreamCut : ModelError("回复还没传完,连接就被断开了")
-    class Server(val status: Int) : ModelError("模型服务出错(HTTP $status)")
+    class Server(val status: Int = 500, val detail: String = "", cause: Throwable? = null) : ModelError(
+        if (detail.isEmpty()) "模型服务出错(HTTP $status)" else "模型服务出错(HTTP $status): $detail",
+        cause,
+    ) {
+        constructor(detail: String, cause: Throwable? = null) : this(500, detail, cause)
+    }
     class ContentRefused : ModelError("模型拒绝处理该内容")
     /** 服务端明确拒绝思考强度参数:保留服务端原话,引导改档位,不能误报成地址或接口错误。 */
     class ReasoningEffortRejected(val detail: String) : ModelError("模型不接受所选的思考强度")
