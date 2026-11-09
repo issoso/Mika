@@ -68,24 +68,29 @@ class McpSessionRegistry(
         session
     }
 
-    suspend fun call(sessionId: String, toolName: String, argumentsJson: String): JsonObject = lock.withLock {
-        ensureEnabledLocked()
-        val now = clock()
-        val expiredId = expireIdleLocked(now)
-        if (expiredId == sessionId) {
-            throw McpTaskTools.ToolError("Tool session $sessionId has expired due to inactivity.")
+    suspend fun call(sessionId: String, toolName: String, argumentsJson: String): JsonObject {
+        val session = lock.withLock {
+            ensureEnabledLocked()
+            val now = clock()
+            val expiredId = expireIdleLocked(now)
+            if (expiredId == sessionId) {
+                throw McpTaskTools.ToolError("Tool session $sessionId has expired due to inactivity.")
+            }
+            val current = active?.takeIf { it.id == sessionId }
+                ?: throw McpTaskTools.ToolError("No active tool session with id $sessionId")
+            current.lastActiveAtMs = now
+            current.session
         }
-        val current = active?.takeIf { it.id == sessionId }
-            ?: throw McpTaskTools.ToolError("No active tool session with id $sessionId")
-        current.lastActiveAtMs = now
-        val content = current.session.call(toolName, argumentsJson)
-        current.lastActiveAtMs = clock()
+        val content = session.call(toolName, argumentsJson)
+        lock.withLock {
+            active?.takeIf { it.id == sessionId }?.let { it.lastActiveAtMs = clock() }
+        }
         if ((content["ok"] as? JsonPrimitive)?.contentOrNull == "false" &&
             (content["error"] as? JsonPrimitive)?.contentOrNull == "unknown_tool"
         ) {
             throw McpTaskTools.ToolError("Unknown session tool: $toolName")
         }
-        content
+        return content
     }
 
     suspend fun close(sessionId: String): Boolean = lock.withLock {

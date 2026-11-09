@@ -25,7 +25,7 @@ class RemoteEndpoints(
         req: HttpRequest,
         deviceAccess: Boolean = true,
         historyAccess: Boolean = true,
-        directDriveAccess: Boolean = true,
+        directDriveAccess: Boolean = false,
     ): HttpResponse {
         // Relay adapters do not carry the phone's bearer token. They still get one isolated task namespace,
         // never the internal unscoped view and never local history.

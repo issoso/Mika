@@ -92,7 +92,7 @@ class McpTaskTools(
                 put("name", t.name)
                 put("description", t.description)
                 put("inputSchema", t.schema)
-                putJsonObject("annotations\") {
+                putJsonObject("annotations") {
                     put("readOnlyHint", t.readOnly)
                     if (!t.readOnly) put("destructiveHint", t.name != ANSWER)
                     put("openWorldHint", t.name == RUN || t.name == STEER || t.name == McpSessionRegistry.CALL)
@@ -130,7 +130,7 @@ class McpTaskTools(
             } }
             LIST -> buildJsonObject {
                 putJsonArray("tasks") {
-                    service.list(optInt(args, "limit\") ?: DEFAULT_LIST).forEach { t ->
+                    service.list(optInt(args, "limit") ?: DEFAULT_LIST).forEach { t ->
                         add(buildJsonObject {
                             put("task_id", t.id); put("status", RemoteStatus.of(t.state)); put("goal", t.goal)
                             put("conversation", t.conversation); put("started_at_ms", t.createdAtMs)
