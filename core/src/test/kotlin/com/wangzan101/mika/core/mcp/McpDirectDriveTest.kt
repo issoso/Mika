@@ -5,6 +5,7 @@ import com.wangzan101.mika.core.cap.sandbox.CommandResult
 import com.wangzan101.mika.core.cap.sandbox.SandboxPort
 import com.wangzan101.mika.core.remote.HttpRequest
 import com.wangzan101.mika.core.remote.RemoteEndpoints
+import com.wangzan101.mika.core.remote.RemoteHost
 import com.wangzan101.mika.core.run.MemoryRunStore
 import com.wangzan101.mika.core.run.RunId
 import com.wangzan101.mika.core.run.RunPhase
@@ -219,5 +220,69 @@ class McpDirectDriveTest {
             .jsonObject.getValue("result").jsonObject.getValue("tools").jsonArray
             .map { it.jsonObject.getValue("name").jsonPrimitive.content }
         assertFalse(relayTools.contains("mika_open_tool_session"))
+    }
+
+    @Test
+    fun remoteHostDynamicallyEvaluatesDirectDriveAccess() {
+        var directDriveSwitch = false
+        val host = RemoteHost(
+            tasks = FakeRemoteTasks(),
+            token = { null },
+            port = 0,
+            allowAllInterfaces = false,
+            serverVersion = "1.0.0",
+            sessions = registry,
+            directDriveAccess = { directDriveSwitch },
+        )
+        val listBody = """{"jsonrpc":"2.0","id":1,"method":"tools/list","_meta":{"protocolVersion":"${McpRpc.MODERN}","clientCapabilities":{}}}"""
+        val req = HttpRequest(
+            method = "POST",
+            path = McpRpc.PATH,
+            headers = mapOf(
+                "content-type" to "application/json",
+                "mcp-protocol-version" to McpRpc.MODERN,
+            ),
+            body = listBody.toByteArray(Charsets.UTF_8),
+            remote = InetAddress.getLoopbackAddress(),
+        )
+        val offTools = Json.parseToJsonElement(host.handle(req).body.decodeToString())
+            .jsonObject.getValue("result").jsonObject.getValue("tools").jsonArray
+            .map { it.jsonObject.getValue("name").jsonPrimitive.content }
+        assertFalse(offTools.contains("mika_open_tool_session"))
+
+        directDriveSwitch = true
+        val onTools = Json.parseToJsonElement(host.handle(req).body.decodeToString())
+            .jsonObject.getValue("result").jsonObject.getValue("tools").jsonArray
+            .map { it.jsonObject.getValue("name").jsonPrimitive.content }
+        assertTrue(onTools.contains("mika_open_tool_session"))
+    }
+
+    @Test
+    fun sessionOwnerIsolationPreventsCrossClientAccess() = kotlinx.coroutines.runBlocking {
+        val clientA = registry.scope("client-a")
+        val clientB = registry.scope("client-b")
+
+        val sessionA = clientA.open()
+        val sessionId = sessionA.spec.id.value
+
+        var bCallFailed = false
+        try {
+            clientB.call(sessionId, "run_command", """{"command":"echo hi"}""")
+        } catch (e: McpTaskTools.ToolError) {
+            bCallFailed = true
+            assertTrue(e.message?.contains("belongs to another client") == true)
+        }
+        assertTrue(bCallFailed)
+
+        var bCloseFailed = false
+        try {
+            clientB.close(sessionId)
+        } catch (e: McpTaskTools.ToolError) {
+            bCloseFailed = true
+            assertTrue(e.message?.contains("belongs to another client") == true)
+        }
+        assertTrue(bCloseFailed)
+
+        assertTrue(clientA.close(sessionId))
     }
 }

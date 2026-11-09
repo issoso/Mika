@@ -49,17 +49,18 @@ class McpRuntime(
     val device: AndroidDeviceAccess,
     val relaySettings: RelaySettings,
     private val history: com.wangzan101.mika.core.remote.RemoteHistory? = null,
+    val sessions: com.wangzan101.mika.core.mcp.McpSessionRegistry? = null,
 ) {
     private val _state = MutableStateFlow<McpServerState>(McpServerState.Off)
     val state: StateFlow<McpServerState> = _state.asStateFlow()
     @Volatile private var host: RemoteHost? = null
     private var hostListen = McpModes.Listen.Off
     private val records: RunExportSource? = (tasks as? RemoteTaskHub)?.let { hub -> RemoteRunExport(hub) { RunStore(context) } }
-    private val endpoints = RemoteEndpoints(tasks, BuildConfig.VERSION_NAME, device = device.access, history = history, records = records)
+    private val endpoints = RemoteEndpoints(tasks, BuildConfig.VERSION_NAME, device = device.access, history = history, records = records, sessions = sessions)
     private val relayAccess = RemoteAccess(token = { if (relaySettings.config.value.enabled) settings.token() else null })
     // 经网关来的请求要另开「允许经网关唤醒和解锁」才看得到屏幕能力;手机上的远程亮屏与解锁许可照样要开。
     private val relay = RelayClient(CoroutineScope(SupervisorJob() + Dispatchers.IO), { req ->
-        relayAccess.handle(req) { endpoints.handle(it, deviceAccess = relaySettings.config.value.deviceAccess, historyAccess = false) }
+        relayAccess.handle(req) { endpoints.handle(it, deviceAccess = relaySettings.config.value.deviceAccess, historyAccess = false, directDriveAccess = false) }
     })
     private val relayNetwork = RelayNetwork(context, relay::networkChanged)
     val relayState get() = relay.state
@@ -154,7 +155,8 @@ class McpRuntime(
         val network = want == McpModes.Listen.PrivateNetworks
         val h = RemoteHost(tasks, { if (settings.enabled.value) settings.token() else null }, settings.port, allowAllInterfaces = network,
             serverVersion = BuildConfig.VERSION_NAME, onError = { Log.w(TAG, "computer access server error", it) },
-            loopbackToken = usb::token, device = device.access, endpoints = endpoints)
+            loopbackToken = usb::token, device = device.access, endpoints = endpoints,
+            directDriveAccess = { settings.directDriveEnabled.value && (sessions?.isEnabled ?: true) })
         return try {
             h.start()
             host = h

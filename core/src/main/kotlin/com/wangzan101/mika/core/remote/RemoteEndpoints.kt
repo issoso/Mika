@@ -32,7 +32,7 @@ class RemoteEndpoints(
         val owner = req.accessOwner ?: "relay"
         val scopedTasks = tasks.scope(owner)
         val service = RemoteTaskService(scopedTasks, records = records?.scope(owner))
-        val sessionRegistry = sessions?.takeIf { directDriveAccess }
+        val sessionRegistry = sessions?.takeIf { directDriveAccess && it.isEnabled }?.scope(owner)
         val rpc = McpRpc(McpTaskTools(service, device.takeIf { deviceAccess }, sessionRegistry), serverVersion) { remote, name ->
             seen(remote, name)
         }
