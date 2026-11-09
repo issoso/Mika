@@ -1,6 +1,7 @@
 package com.wangzan101.mika.core.remote
 
 import com.wangzan101.mika.core.device.DeviceAccess
+import com.wangzan101.mika.core.mcp.McpSessionRegistry
 import java.net.InetAddress
 import java.net.InetSocketAddress
 
@@ -25,7 +26,9 @@ class RemoteHost(
     device: DeviceAccess? = null,
     history: RemoteHistory? = null,
     records: RunExportSource? = null,
-    private val endpoints: RemoteEndpoints = RemoteEndpoints(tasks, serverVersion, clock, device, history, records),
+    sessions: McpSessionRegistry? = null,
+    private val directDriveAccess: () -> Boolean = { sessions?.isEnabled == true },
+    private val endpoints: RemoteEndpoints = RemoteEndpoints(tasks, serverVersion, clock, device, history, records, sessions),
 ) {
     private val access = RemoteAccess(token, clock, loopbackToken = loopbackToken)
     val activity get() = endpoints.activity
@@ -33,7 +36,9 @@ class RemoteHost(
 
     val boundPort: Int get() = server?.port ?: -1
 
-    fun handle(req: HttpRequest): HttpResponse = access.handle(req, endpoints::handle)
+    fun handle(req: HttpRequest): HttpResponse = access.handle(req) {
+        endpoints.handle(it, directDriveAccess = directDriveAccess())
+    }
 
     /** 开始监听;端口被占等绑定失败时抛出异常。 */
     fun start() {

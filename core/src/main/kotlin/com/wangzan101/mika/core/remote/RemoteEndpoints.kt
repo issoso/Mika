@@ -2,10 +2,10 @@ package com.wangzan101.mika.core.remote
 
 import com.wangzan101.mika.core.device.DeviceAccess
 import com.wangzan101.mika.core.mcp.McpRpc
+import com.wangzan101.mika.core.mcp.McpSessionRegistry
 import com.wangzan101.mika.core.mcp.McpTaskTools
 import kotlinx.coroutines.flow.MutableStateFlow
 import kotlinx.coroutines.flow.asStateFlow
-import java.net.InetAddress
 
 /** HTTP 与 MCP 每次请求都从同一个已认证归属构造任务服务,避免某条协议路径绕过任务、文件或导出权限。 */
 class RemoteEndpoints(
@@ -15,18 +15,27 @@ class RemoteEndpoints(
     private val device: DeviceAccess? = null,
     private val history: RemoteHistory? = null,
     private val records: RunExportSource? = null,
+    private val sessions: McpSessionRegistry? = null,
 ) {
     private val clients = LinkedHashMap<String, Long>()
     private val mutable = MutableStateFlow(RemoteActivity())
     val activity = mutable.asStateFlow()
 
-    fun handle(req: HttpRequest, deviceAccess: Boolean = true, historyAccess: Boolean = true): HttpResponse {
+    fun handle(
+        req: HttpRequest,
+        deviceAccess: Boolean = true,
+        historyAccess: Boolean = true,
+        directDriveAccess: Boolean = false,
+    ): HttpResponse {
         // Relay adapters do not carry the phone's bearer token. They still get one isolated task namespace,
         // never the internal unscoped view and never local history.
         val owner = req.accessOwner ?: "relay"
         val scopedTasks = tasks.scope(owner)
         val service = RemoteTaskService(scopedTasks, records = records?.scope(owner))
-        val rpc = McpRpc(McpTaskTools(service, device.takeIf { deviceAccess }), serverVersion) { remote, name -> seen(remote, name) }
+        val sessionRegistry = sessions?.takeIf { directDriveAccess && it.isEnabled }?.scope(owner)
+        val rpc = McpRpc(McpTaskTools(service, device.takeIf { deviceAccess }, sessionRegistry), serverVersion) { remote, name ->
+            seen(remote, name)
+        }
         if (req.path == McpRpc.PATH) return rpc.handle(req)
         if (req.path == RemoteTaskApi.ROOT || req.path.startsWith("${RemoteTaskApi.ROOT}/")) {
             seen(req.remote, req.header("x-mika-client")?.take(64))
@@ -36,7 +45,7 @@ class RemoteEndpoints(
         return RemoteTaskApi.error(404, "not_found", "No such endpoint")
     }
 
-    private fun seen(remote: InetAddress, name: String?) {
+    private fun seen(remote: java.net.InetAddress, name: String?) {
         val now = clock()
         synchronized(this) {
             val who = remote.hostAddress ?: "?"

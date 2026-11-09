@@ -107,13 +107,37 @@ class MikaApp : Application(), WebOwner, SandboxOwner, TaskEnvironment.Owner, Ph
         val settings = com.wangzan101.mika.settings.McpSettings(settingsDir, com.wangzan101.mika.settings.KeystoreKeyCipher("mika-mcp-token"))
         val history = com.wangzan101.mika.task.PhoneHistory(conversations, com.wangzan101.mika.record.RunStore(this), detailedTraces.store,
             allowed = { settings.historyEnabled.value }, live = { remoteTasks.list(100) })
+        val sessions = com.wangzan101.mika.core.mcp.McpSessionRegistry(
+            assemble = { spec ->
+                val metrics = resources.displayMetrics
+                val phoneScreen = com.wangzan101.mika.cap.phone.a11y.LazyPhoneScreen(
+                    metrics.widthPixels, metrics.heightPixels,
+                    listApps = {
+                        kotlinx.coroutines.withContext(kotlinx.coroutines.Dispatchers.IO) {
+                            com.wangzan101.mika.cap.phone.a11y.launchableApps(packageManager, packageName)
+                        }
+                    },
+                    acquire = {
+                        throw com.wangzan101.mika.cap.phone.a11y.PhoneUnavailable("Direct drive requires screen automation service")
+                    }
+                )
+                com.wangzan101.mika.core.assembly.toolDispatcher(
+                    screen = phoneScreen,
+                    sandbox = com.wangzan101.mika.cap.sandbox.AndroidSandbox(this, sandboxState),
+                    workspace = { spec.threadId },
+                    runSpec = spec,
+                )
+            },
+            enabled = { settings.directDriveEnabled.value },
+        )
         com.wangzan101.mika.mcp.McpRuntime(this, settings,
             com.wangzan101.mika.settings.McpUsbSettings(settingsDir,
                 bootId = { android.provider.Settings.Global.getString(contentResolver, android.provider.Settings.Global.BOOT_COUNT) ?: "null" },
                 infoFile = { getExternalFilesDir(null)?.let { java.io.File(it, com.wangzan101.mika.core.mcp.McpUsb.INFO_FILE) } }),
             remoteTasks, deviceAccess,
             com.wangzan101.mika.settings.RelaySettings(settingsDir, com.wangzan101.mika.settings.KeystoreKeyCipher("mika-remote-relay")),
-            history)
+            history,
+            sessions = sessions)
     }
     val childRuns by lazy { FileChildRunStore(java.io.File(filesDir, "children-v3.json")) }
 

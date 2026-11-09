@@ -23,11 +23,17 @@ import kotlinx.serialization.json.putJsonObject
 class McpTaskTools(
     private val service: RemoteTaskService,
     device: DeviceAccess? = null,
+    sessions: McpSessionRegistry? = null,
 ) {
-    constructor(tasks: RemoteTasks, pollMs: Long = 250, device: DeviceAccess? = null) :
-        this(RemoteTaskService(tasks, pollMs), device)
+    constructor(
+        tasks: RemoteTasks,
+        pollMs: Long = 250,
+        device: DeviceAccess? = null,
+        sessions: McpSessionRegistry? = null,
+    ) : this(RemoteTaskService(tasks, pollMs), device, sessions)
 
     private val deviceTools = device?.let(::McpDeviceTools)
+    private val sessionTools = sessions?.let(::McpSessionTools)
     class ToolError(message: String) : Exception(message)
 
     data class Tool(val name: String, val description: String, val schema: JsonObject, val readOnly: Boolean)
@@ -77,7 +83,7 @@ class McpTaskTools(
             schema(required = emptyList()) {
                 putJsonObject("limit") { put("type", "integer"); put("minimum", 1); put("maximum", MAX_LIST); put("description", "How many (default $DEFAULT_LIST).") }
             }, readOnly = true),
-    ) + deviceTools?.tools.orEmpty()
+    ) + deviceTools?.tools.orEmpty() + sessionTools?.tools.orEmpty()
 
     /** MCP 的工具定义(tools/list 的一项)。 */
     fun definitions(): JsonArray = buildJsonArray {
@@ -89,7 +95,7 @@ class McpTaskTools(
                 putJsonObject("annotations") {
                     put("readOnlyHint", t.readOnly)
                     if (!t.readOnly) put("destructiveHint", t.name != ANSWER)
-                    put("openWorldHint", t.name == RUN || t.name == STEER)
+                    put("openWorldHint", t.name == RUN || t.name == STEER || t.name == McpSessionRegistry.CALL)
                 }
             })
         }
@@ -132,8 +138,11 @@ class McpTaskTools(
                     }
                 }
             }
-            else -> if (deviceTools?.tools?.any { it.name == name } == true) deviceTools.call(name, args)
-                else throw ToolError("Unknown tool: $name")
+            else -> when {
+                deviceTools?.tools?.any { it.name == name } == true -> deviceTools.call(name, args)
+                sessionTools?.tools?.any { it.name == name } == true -> sessionTools.call(name, args)
+                else -> throw ToolError("Unknown tool: $name")
+            }
         }
     } catch (e: RemoteTaskError) {
         // 按错误类型换回原 MCP 客户端看到的说法(带 MCP 工具名);共用服务不包含 MCP 命令名。
@@ -191,7 +200,6 @@ class McpTaskTools(
             "Mika has shown its usual notification there; keep waiting with mika_wait_task or cancel the task."
 
         fun newConversation(): String = RemoteTaskService.newConversation()
-        fun isConversation(id: String): Boolean = RemoteTaskService.isConversation(id)
 
         private fun schema(required: List<String>, props: kotlinx.serialization.json.JsonObjectBuilder.() -> Unit) = buildJsonObject {
             put("type", "object")

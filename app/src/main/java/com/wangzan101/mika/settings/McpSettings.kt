@@ -26,6 +26,7 @@ class McpSettings(private val dir: File, private val cipher: KeyCipher, private 
     private val tokenFile = File(dir, "mcp-token.bin")
     private val _enabled: MutableStateFlow<Boolean>
     private val _historyEnabled: MutableStateFlow<Boolean>
+    private val _directDriveEnabled: MutableStateFlow<Boolean>
     @Volatile private var cachedToken: String? = null
 
     /** 监听的端口;文件里没写就用 [DEFAULT_PORT]。 */
@@ -35,15 +36,23 @@ class McpSettings(private val dir: File, private val cipher: KeyCipher, private 
         val o = runCatching { Json.parseToJsonElement(file.readText()) as? JsonObject }.getOrNull()
         _enabled = MutableStateFlow((o?.get("enabled") as? JsonPrimitive)?.booleanOrNull ?: false)
         _historyEnabled = MutableStateFlow((o?.get("historyEnabled") as? JsonPrimitive)?.booleanOrNull ?: false)
+        _directDriveEnabled = MutableStateFlow((o?.get("directDriveEnabled") as? JsonPrimitive)?.booleanOrNull ?: false)
         port = (o?.get("port") as? JsonPrimitive)?.intOrNull?.takeIf { it in 1024..65535 } ?: DEFAULT_PORT
     }
 
     val enabled: StateFlow<Boolean> = _enabled.asStateFlow()
     val historyEnabled: StateFlow<Boolean> = _historyEnabled.asStateFlow()
+    val directDriveEnabled: StateFlow<Boolean> = _directDriveEnabled.asStateFlow()
 
     /** Applies to authenticated USB and private-network clients; older settings grant no history access. */
     @Synchronized fun setHistoryEnabled(on: Boolean) {
         _historyEnabled.value = on
+        save()
+    }
+
+    /** Controls whether authenticated clients can open model-less direct-drive tool sessions; off by default. */
+    @Synchronized fun setDirectDriveEnabled(on: Boolean) {
+        _directDriveEnabled.value = on
         save()
     }
 
@@ -75,7 +84,10 @@ class McpSettings(private val dir: File, private val cipher: KeyCipher, private 
         dir.mkdirs()
         val tmp = File(dir, file.name + ".tmp")
         tmp.writeText(buildJsonObject {
-            put("enabled", _enabled.value); put("port", port); put("historyEnabled", _historyEnabled.value)
+            put("enabled", _enabled.value)
+            put("port", port)
+            put("historyEnabled", _historyEnabled.value)
+            put("directDriveEnabled", _directDriveEnabled.value)
         }.toString())
         Files.move(tmp.toPath(), file.toPath(), StandardCopyOption.REPLACE_EXISTING, StandardCopyOption.ATOMIC_MOVE)
     }
