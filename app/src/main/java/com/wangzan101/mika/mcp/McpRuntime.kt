@@ -174,6 +174,7 @@ class McpRuntime(
         relayNetwork.stop()
         relay.stop()
         stopListener()
+        sessions?.let { kotlinx.coroutines.runBlocking { it.closeAll() } }
     }
 
     private fun stopListener() {
@@ -181,6 +182,7 @@ class McpRuntime(
         host = null
         hostListen = McpModes.Listen.Off
         if (_state.value is McpServerState.Listening) _state.value = McpServerState.Off
+        sessions?.let { kotlinx.coroutines.runBlocking { it.closeAll() } }
     }
 
     /** 给电脑跑的「经 USB 连接」脚本:不带秘密,App 启动时写一次(外部存储不可用就跳过)。 */

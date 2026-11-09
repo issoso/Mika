@@ -274,14 +274,24 @@ class McpDirectDriveTest {
         }
         assertTrue(bCallFailed)
 
-        var bCloseFailed = false
+        // Raw registry without owner cannot call or close Client A's session (Fail-closed)
+        var rawCallFailed = false
         try {
-            clientB.close(sessionId)
+            registry.call(sessionId, "run_command", """{"command":"echo hi"}""")
         } catch (e: McpTaskTools.ToolError) {
-            bCloseFailed = true
+            rawCallFailed = true
             assertTrue(e.message?.contains("belongs to another client") == true)
         }
-        assertTrue(bCloseFailed)
+        assertTrue(rawCallFailed)
+
+        var rawCloseFailed = false
+        try {
+            registry.close(sessionId)
+        } catch (e: McpTaskTools.ToolError) {
+            rawCloseFailed = true
+            assertTrue(e.message?.contains("belongs to another client") == true)
+        }
+        assertTrue(rawCloseFailed)
 
         assertTrue(clientA.close(sessionId))
     }

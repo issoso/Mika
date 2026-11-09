@@ -46,7 +46,13 @@ open class McpSessionRegistry(
         require(idleTimeoutMs > 0) { "idleTimeoutMs must be positive" }
     }
 
-    private data class Entry(val id: String, val session: McpToolSession, var lastActiveAtMs: Long, val owner: String? = null)
+    private data class Entry(
+        val id: String,
+        val session: McpToolSession,
+        var lastActiveAtMs: Long,
+        val owner: String? = null,
+        var inFlight: Int = 0,
+    )
 
     private val lock = Mutex()
     private var active: Entry? = null
@@ -71,7 +77,7 @@ open class McpSessionRegistry(
     }
 
     open suspend fun call(sessionId: String, toolName: String, argumentsJson: String, owner: String? = null): JsonObject {
-        val session = lock.withLock {
+        val (session, entry) = lock.withLock {
             ensureEnabledLocked()
             val now = clock()
             val expiredId = expireIdleLocked(now)
@@ -80,15 +86,20 @@ open class McpSessionRegistry(
             }
             val current = active?.takeIf { it.id == sessionId }
                 ?: throw McpTaskTools.ToolError("No active tool session with id $sessionId")
-            if (current.owner != null && owner != null && current.owner != owner) {
+            if (current.owner != owner) {
                 throw McpTaskTools.ToolError("Tool session $sessionId belongs to another client.")
             }
             current.lastActiveAtMs = now
-            current.session
+            current.inFlight++
+            current.session to current
         }
-        val content = session.call(toolName, argumentsJson)
-        lock.withLock {
-            active?.takeIf { it.id == sessionId }?.let { it.lastActiveAtMs = clock() }
+        val content = try {
+            session.call(toolName, argumentsJson)
+        } finally {
+            lock.withLock {
+                entry.inFlight = maxOf(0, entry.inFlight - 1)
+                entry.lastActiveAtMs = clock()
+            }
         }
         if ((content["ok"] as? JsonPrimitive)?.contentOrNull == "false" &&
             (content["error"] as? JsonPrimitive)?.contentOrNull == "unknown_tool"
@@ -104,7 +115,7 @@ open class McpSessionRegistry(
         expireIdleLocked(now)
         val current = active?.takeIf { it.id == sessionId }
             ?: throw McpTaskTools.ToolError("No active tool session with id $sessionId")
-        if (current.owner != null && owner != null && current.owner != owner) {
+        if (current.owner != owner) {
             throw McpTaskTools.ToolError("Tool session $sessionId belongs to another client.")
         }
         active = null
@@ -133,6 +144,11 @@ open class McpSessionRegistry(
         if (current.session.isClosed) {
             active = null
             return current.id
+        }
+        // In-flight lease protection: never expire a session while tools are actively executing!
+        if (current.inFlight > 0) {
+            current.lastActiveAtMs = now
+            return null
         }
         if (now - current.lastActiveAtMs >= idleTimeoutMs) {
             active = null
