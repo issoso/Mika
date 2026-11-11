@@ -82,10 +82,15 @@ fun McpScreen(runtime: McpRuntime, onBack: () -> Unit) {
         onCopy = { copy(context, it) }, onRegenerate = { confirmRegenerate = true },
         deviceSettings = {
             val historyEnabled by runtime.settings.historyEnabled.collectAsState()
+            val directDriveEnabled by runtime.settings.directDriveEnabled.collectAsState()
             GroupCard {
                 ListRow(MikaIcons.Desktop, stringResource(R.string.mcp_history_title), stringResource(R.string.mcp_history_detail),
                     first = true, onClick = { runtime.settings.setHistoryEnabled(!historyEnabled) }) {
                     MikaSwitch(historyEnabled, runtime.settings::setHistoryEnabled, Modifier.testTag("computer-history"))
+                }
+                ListRow(MikaIcons.Code, stringResource(R.string.mcp_direct_drive_title), stringResource(R.string.mcp_direct_drive_detail),
+                    onClick = { runtime.settings.setDirectDriveEnabled(!directDriveEnabled) }) {
+                    MikaSwitch(directDriveEnabled, runtime.settings::setDirectDriveEnabled, Modifier.testTag("computer-direct-drive"))
                 }
             }
             DeviceAccessSection(runtime.device.settings)
