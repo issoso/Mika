@@ -65,4 +65,6 @@
     <string name="mcp_cli_connection_check">connect 会验证连接，成功后顶部显示最近请求。</string>
     <string name="mcp_history_title">允许电脑查看历史记录</string>
     <string name="mcp_history_detail">连接的电脑可读取所有对话、运行记录和已录制的 Trace 正文，包括脱敏后的模型请求与回复。适用于 USB 和私有网络连接。</string>
+    <string name="mcp_direct_drive_title">允许电脑直接驱动工具</string>
+    <string name="mcp_direct_drive_detail">已认证的 USB 和私有网络 MCP 客户端可打开无模型工具会话并直接调用手机工具。默认关闭。</string>
 </resources>

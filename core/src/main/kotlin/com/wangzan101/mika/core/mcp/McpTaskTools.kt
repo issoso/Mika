@@ -200,6 +200,7 @@ class McpTaskTools(
             "Mika has shown its usual notification there; keep waiting with mika_wait_task or cancel the task."
 
         fun newConversation(): String = RemoteTaskService.newConversation()
+        fun isConversation(id: String): Boolean = RemoteTaskService.isConversation(id)
 
         private fun schema(required: List<String>, props: kotlinx.serialization.json.JsonObjectBuilder.() -> Unit) = buildJsonObject {
             put("type", "object")

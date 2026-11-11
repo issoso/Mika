@@ -1,38 +1,58 @@
 package com.wangzan101.mika.mcp
 
-import com.wangzan101.mika.core.mcp.McpRpc
 import android.content.Context
 import android.content.Intent
 import android.util.Log
 import com.wangzan101.mika.BuildConfig
-import com.wangzan101.mika.core.remote.RemoteAccess
-import com.wangzan101.mika.core.remote.RemoteActivity
-import com.wangzan101.mika.core.remote.RemoteHost
-import com.wangzan101.mika.core.remote.RemoteEndpoints
+import com.wangzan101.mika.MikaApp
+import com.wangzan101.mika.R
+import com.wangzan101.mika.cap.phone.a11y.AndroidScreen
+import com.wangzan101.mika.cap.phone.a11y.LazyPhoneScreen
+import com.wangzan101.mika.cap.phone.a11y.PhoneUnavailable
+import com.wangzan101.mika.cap.phone.a11y.ScreenAccessibility
+import com.wangzan101.mika.cap.phone.a11y.launchableApps
+import com.wangzan101.mika.cap.phone.display.AgentDisplay
+import com.wangzan101.mika.cap.phone.display.LazyDisplay
+import com.wangzan101.mika.cap.phone.shell.AppCopyReader
+import com.wangzan101.mika.cap.sandbox.AndroidSandbox
+import com.wangzan101.mika.core.assembly.toolDispatcher
+import com.wangzan101.mika.core.mcp.McpServer
+import com.wangzan101.mika.core.mcp.McpSessionRegistry
+import com.wangzan101.mika.core.mcp.McpTaskHost
+import com.wangzan101.mika.core.mcp.McpUsb
 import com.wangzan101.mika.core.remote.RelayClient
 import com.wangzan101.mika.core.remote.RelayGateway
+import com.wangzan101.mika.core.remote.RemoteAccess
+import com.wangzan101.mika.core.remote.RemoteActivity
+import com.wangzan101.mika.core.remote.RemoteEndpoints
+import com.wangzan101.mika.core.remote.RemoteHost
+import com.wangzan101.mika.core.remote.RemoteTasks
+import com.wangzan101.mika.core.remote.RunExportSource
+import com.wangzan101.mika.core.run.Attendance
+import com.wangzan101.mika.core.run.RunSpec
+import com.wangzan101.mika.core.shell.HelperHandoff
+import com.wangzan101.mika.core.tool.ToolDispatcher
+import com.wangzan101.mika.core.uistate.AppAccessScreenPort
+import com.wangzan101.mika.device.AndroidDeviceAccess
+import com.wangzan101.mika.i18n.tr
+import com.wangzan101.mika.record.RunStore
+import com.wangzan101.mika.settings.McpSettings
+import com.wangzan101.mika.settings.McpUsbSettings
 import com.wangzan101.mika.settings.RelaySettings
+import com.wangzan101.mika.task.RemoteRunExport
+import com.wangzan101.mika.task.RemoteTaskHub
 import kotlinx.coroutines.CoroutineScope
 import kotlinx.coroutines.Dispatchers
 import kotlinx.coroutines.SupervisorJob
-import com.wangzan101.mika.core.mcp.McpUsb
-import com.wangzan101.mika.core.shell.HelperHandoff
-import com.wangzan101.mika.device.AndroidDeviceAccess
-import com.wangzan101.mika.core.remote.RemoteTasks
-import com.wangzan101.mika.core.remote.RunExportSource
-import com.wangzan101.mika.record.RunStore
-import com.wangzan101.mika.task.RemoteRunExport
-import com.wangzan101.mika.task.RemoteTaskHub
-import com.wangzan101.mika.settings.McpSettings
-import com.wangzan101.mika.settings.McpUsbSettings
 import kotlinx.coroutines.flow.MutableStateFlow
 import kotlinx.coroutines.flow.StateFlow
 import kotlinx.coroutines.flow.asStateFlow
+import kotlinx.coroutines.withContext
 import java.io.File
 import java.net.Inet4Address
 import java.net.NetworkInterface
+import java.util.Collections
 
-/** 电脑连接此刻的样子:关着、在监听哪个端口、或没能开起来(端口被占等)。 */
 sealed interface McpServerState {
     data object Off : McpServerState
     data class Listening(val port: Int) : McpServerState
@@ -49,14 +69,17 @@ class McpRuntime(
     val device: AndroidDeviceAccess,
     val relaySettings: RelaySettings,
     private val history: com.wangzan101.mika.core.remote.RemoteHistory? = null,
-    val sessions: com.wangzan101.mika.core.mcp.McpSessionRegistry? = null,
+    sessions: McpSessionRegistry? = null,
 ) {
+    val sessions: McpSessionRegistry? = (context.applicationContext as? MikaApp)?.let { app ->
+        createDirectDriveSessions(app, settings)
+    } ?: sessions
     private val _state = MutableStateFlow<McpServerState>(McpServerState.Off)
     val state: StateFlow<McpServerState> = _state.asStateFlow()
     @Volatile private var host: RemoteHost? = null
     private var hostListen = McpModes.Listen.Off
     private val records: RunExportSource? = (tasks as? RemoteTaskHub)?.let { hub -> RemoteRunExport(hub) { RunStore(context) } }
-    private val endpoints = RemoteEndpoints(tasks, BuildConfig.VERSION_NAME, device = device.access, history = history, records = records, sessions = sessions)
+    private val endpoints = RemoteEndpoints(tasks, BuildConfig.VERSION_NAME, device = device.access, history = history, records = records, sessions = this.sessions)
     private val relayAccess = RemoteAccess(token = { if (relaySettings.config.value.enabled) settings.token() else null })
     // 经网关来的请求要另开「允许经网关唤醒和解锁」才看得到屏幕能力;手机上的远程亮屏与解锁许可照样要开。
     private val relay = RelayClient(CoroutineScope(SupervisorJob() + Dispatchers.IO), { req ->
@@ -81,8 +104,6 @@ class McpRuntime(
         }
     }
 
-    fun setRelayDeviceAccess(on: Boolean) = relaySettings.setDeviceAccess(on)
-
     fun setRelayEnabled(on: Boolean) {
         if (!on) { relayNetwork.stop(); relay.stop() }
         try { relaySettings.setEnabled(on) } finally { if (!on) apply() }
@@ -97,13 +118,11 @@ class McpRuntime(
 
     fun listen(): McpModes.Listen = McpModes.listen(settings.enabled.value, usb.enabled.value)
 
-    /** 设置页上局域网那种的开关。 */
     fun setEnabled(on: Boolean) {
         settings.setEnabled(on)
         apply()
     }
 
-    /** 设置页上 USB 那种的开关(电脑经 adb 开关的走 [McpService] 的动作,同一套)。 */
     fun setUsbEnabled(on: Boolean) {
         if (on) usb.enable() else usb.disable()
         apply()
@@ -118,7 +137,7 @@ class McpRuntime(
     }
 
     /**
-     * 有一种开着就把服务起来(已经在跑就让它按开关重新对一遍)。从后台起前台服务可能被系统拒绝,这时记成没开起来,
+     * 开关开着时让前台服务在跑。开机广播在后台收时部分系统可能拒起前台服务:记一行日志就行,
      * 等下次打开 Mika 的界面再起。
      */
     fun ensureRunning() {
@@ -156,7 +175,7 @@ class McpRuntime(
         val h = RemoteHost(tasks, { if (settings.enabled.value) settings.token() else null }, settings.port, allowAllInterfaces = network,
             serverVersion = BuildConfig.VERSION_NAME, onError = { Log.w(TAG, "computer access server error", it) },
             loopbackToken = usb::token, device = device.access, endpoints = endpoints,
-            directDriveAccess = { settings.directDriveEnabled.value && (sessions?.isEnabled ?: true) })
+            directDriveAccess = { settings.directDriveEnabled.value && (this.sessions?.isEnabled ?: true) })
         return try {
             h.start()
             host = h
@@ -164,7 +183,7 @@ class McpRuntime(
             _state.value = McpServerState.Listening(h.boundPort)
             true
         } catch (e: Exception) {
-            Log.w(TAG, "could not listen on port ${settings.port}", e)
+            Log.w(TAG, "could not bind computer access server on port ${settings.port}", e)
             _state.value = McpServerState.Failed(e.message ?: e::class.simpleName.orEmpty())
             false
         }
@@ -174,7 +193,7 @@ class McpRuntime(
         relayNetwork.stop()
         relay.stop()
         stopListener()
-        sessions?.let { kotlinx.coroutines.runBlocking { it.closeAll() } }
+        this.sessions?.let { kotlinx.coroutines.runBlocking { it.closeAll() } }
     }
 
     private fun stopListener() {
@@ -182,69 +201,148 @@ class McpRuntime(
         host = null
         hostListen = McpModes.Listen.Off
         if (_state.value is McpServerState.Listening) _state.value = McpServerState.Off
-        sessions?.let { kotlinx.coroutines.runBlocking { it.closeAll() } }
+        this.sessions?.let { kotlinx.coroutines.runBlocking { it.closeAll() } }
     }
 
     /** 给电脑跑的「经 USB 连接」脚本:不带秘密,App 启动时写一次(外部存储不可用就跳过)。 */
     fun writeUsbScript() {
         val dir = context.getExternalFilesDir(null) ?: return
-        val f = File(dir, McpUsb.SCRIPT)
-        val text = McpUsb.script(
-            scriptPath = shortPath(f.absolutePath),
-            helperScript = File(dir, HelperHandoff.USB_SCRIPT).absolutePath,
-            infoPath = File(dir, McpUsb.INFO_FILE).absolutePath,
-            component = "${context.packageName}/${McpService::class.java.name}",
-            onAction = McpModes.ACTION_USB_ON, offAction = McpModes.ACTION_USB_OFF, port = settings.port,
-        )
-        if (runCatching { f.readText() }.getOrNull() == text) return
-        val tmp = File(dir, f.name + ".tmp")
-        tmp.writeText(text)
-        if (!tmp.renameTo(f)) {
-            f.delete()
-            check(tmp.renameTo(f)) { "rename failed" }
-        }
+        dir.mkdirs()
+        val helper = File(dir, HelperHandoff.SCRIPT_NAME).absolutePath
+        File(dir, McpUsb.SCRIPT_FILE).writeText(McpUsb.script(context.packageName, helper, File(dir, McpUsb.INFO_FILE).absolutePath))
+        // 顺手清掉上次开机留下的连接信息(如果有)
+        usb.enabled
     }
 
-    /** 电脑上要跑的那条命令(设置页显示的就是它)。 */
+    /** 电脑上打开 USB 连接要跑的那条 adb 命令(外部存储路径按本机包名算)。 */
     fun usbCommand(): String {
-        val path = context.getExternalFilesDir(null)?.let { File(it, McpUsb.SCRIPT).absolutePath }
-            ?: "/storage/emulated/0/Android/data/${context.packageName}/files/${McpUsb.SCRIPT}"
-        return "adb shell sh " + shortPath(path)
+        val path = (context.getExternalFilesDir(null) ?: File("/sdcard/Android/data/${context.packageName}/files"))
+            .let { File(it, McpUsb.SCRIPT_FILE).absolutePath }
+        return "adb shell sh $path"
     }
 
-    /** 换令牌:旧的当场失效。 */
-    fun regenerateToken(): String = settings.regenerate()
+    fun regenerateToken(): String = settings.regenerateToken()
 
     companion object {
         private const val TAG = "MikaMcp"
 
-        /** 主用户的外部存储在 shell 里也叫 /sdcard;给人看的命令用短写法(和「用电脑启动」的脚本一样)。 */
-        private fun shortPath(path: String) = HelperHandoff.usbCommand(path).removePrefix("adb shell sh ")
+        internal fun createDirectDriveSessions(app: MikaApp, settings: McpSettings): McpSessionRegistry {
+            val closeCallbacks = java.util.concurrent.ConcurrentHashMap<String, () -> Unit>()
+            val assemble: (RunSpec) -> ToolDispatcher = { spec ->
+                val metrics = app.resources.displayMetrics
+                var nativeScreen: AndroidScreen? = null
+                var lazyDisplay: LazyDisplay<AgentDisplay>? = null
+                val phoneScreen = LazyPhoneScreen(
+                    metrics.widthPixels, metrics.heightPixels,
+                    listApps = {
+                        withContext(Dispatchers.IO) {
+                            launchableApps(app.packageManager, app.packageName)
+                        }
+                    },
+                    appCopies = {
+                        app.phone.hub.shell.value?.let { s ->
+                            withContext(Dispatchers.IO) {
+                                runCatching { AppCopyReader.read(s, launchableApps(app.packageManager, app.packageName)) }.getOrNull()
+                            }
+                        }.orEmpty()
+                    },
+                    acquire = {
+                        val shell = app.phone.hub.shell.value
+                            ?: throw PhoneUnavailable(tr(R.string.task_no_phone_helper))
+                        val a11y = ScreenAccessibility.instance.value
+                            ?: throw PhoneUnavailable(tr(R.string.task_no_a11y))
+                        val display = LazyDisplay(metrics.widthPixels, metrics.heightPixels) {
+                            AgentDisplay(shell, metrics.widthPixels, metrics.heightPixels, metrics.densityDpi)
+                        }
+                        lazyDisplay = display
+                        AndroidScreen(
+                            a11y = a11y,
+                            shell = shell,
+                            display = display,
+                            appAccess = app.appAccess,
+                        ).also { nativeScreen = it }
+                    },
+                )
+                closeCallbacks[spec.id.value] = {
+                    runCatching { lazyDisplay?.current?.release() }
+                }
+                val accessedPhone = AppAccessScreenPort(
+                    phoneScreen,
+                    app.appAccess,
+                    packages = { nativeScreen?.accessPackages().orEmpty() },
+                    protectedUi = { app.appAccess.sensitiveUi },
+                    ownPackage = app.packageName,
+                )
+                toolDispatcher(
+                    screen = accessedPhone,
+                    sandbox = AndroidSandbox(app, app.sandboxState),
+                    workspace = { spec.threadId },
+                    runSpec = spec,
+                )
+            }
+            val baseServer = McpServer(
+                assemble = assemble,
+                tasks = McpTaskHost { error("Task submission uses RemoteTaskService") },
+            )
+            return object : McpSessionRegistry(
+                server = baseServer,
+                enabled = { settings.directDriveEnabled.value },
+            ) {
+                override suspend fun openWithStatus(
+                    conversation: String?,
+                    allowedTools: Set<String>?,
+                    owner: String?,
+                    resume: Boolean,
+                ): OpenOutcome {
+                    val outcome = super.openWithStatus(conversation, allowedTools, owner, resume)
+                    val id = outcome.session.spec.id.value
+                    outcome.session.events.subscribe { event ->
+                        if (event is com.wangzan101.mika.core.record.RunEvent.State && event.name == "mcp_session_ended") {
+                            closeCallbacks.remove(id)?.invoke()
+                        }
+                    }
+                    return outcome
+                }
+            }
+        }
 
-        /** 电脑能连的地址:开着的网卡上的局域网、私有组网 IPv4 地址。 */
+        /** 本机在局域网或私有 VPN 上的 IPv4 地址(跳过回环、移动数据网卡和链路本地地址)。 */
         fun addresses(): List<String> = runCatching {
-            NetworkInterface.getNetworkInterfaces()?.toList().orEmpty()
-                .filter { runCatching { it.isUp && !it.isLoopback }.getOrDefault(false) }
-                .flatMap { it.inetAddresses.toList() }
+            Collections.list(NetworkInterface.getNetworkInterfaces())
+                .filter { it.isUp && !it.isLoopback && !isCellular(it.name) }
+                .flatMap { Collections.list(it.inetAddresses) }
                 .filterIsInstance<Inet4Address>()
-                .filter { !it.isLoopbackAddress && !it.isLinkLocalAddress && RemoteAccess.privateAddress(it) }
+                .filter { it.isSiteLocalAddress || isCarrierNat(it) }
                 .mapNotNull { it.hostAddress }
                 .distinct()
+                .sorted()
         }.getOrDefault(emptyList())
 
-        fun url(address: String, port: Int) = "http://$address:$port${McpRpc.PATH}"
+        private fun isCellular(name: String): Boolean {
+            val n = name.lowercase()
+            return n.startsWith("rmnet") || n.startsWith("ccmni") || n.startsWith("pdp") || n.startsWith("clat")
+        }
 
-        /** 给电脑上的 MCP 客户端用的配置片段:地址加 Authorization 头。 */
+        /** 100.64.0.0/10:Tailscale 等私有组网常用这一段。 */
+        private fun isCarrierNat(a: Inet4Address): Boolean {
+            val b = a.address
+            return (b[0].toInt() and 0xff) == 100 && (b[1].toInt() and 0xc0) == 64
+        }
+
+        fun url(host: String, port: Int): String = "http://$host:$port/mcp"
+
+        /** 主流 MCP 客户端认识的 Streamable HTTP 配置片段。 */
         fun clientConfig(url: String, token: String): String = """
-            {
-              "mcpServers": {
-                "mika": {
-                  "type": "http",
-                  "url": "$url",
-                  "headers": { "Authorization": "Bearer $token" }
-                }
-              }
-            }
-        """.trimIndent()
+{
+  "mcpServers": {
+    "mika": {
+      "type": "http",
+      "url": "$url",
+      "headers": {
+        "Authorization": "Bearer $token"
+      }
+    }
+  }
+}""".trimIndent()
     }
 }

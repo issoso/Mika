@@ -65,4 +65,6 @@
     <string name="mcp_cli_connection_check">connect verifies the connection. A successful request updates the time above.</string>
     <string name="mcp_history_title">Allow computers to view history</string>
     <string name="mcp_history_detail">Connected computers can read all conversations, run records and recorded Trace bodies, including redacted model requests and replies. Applies to USB and private-network connections.</string>
+    <string name="mcp_direct_drive_title">Allow remote direct drive</string>
+    <string name="mcp_direct_drive_detail">Authenticated USB and private-network MCP clients can open model-less tool sessions and call phone tools directly. Off by default.</string>
 </resources>

@@ -12,6 +12,7 @@ import kotlinx.serialization.json.JsonNull
 import kotlinx.serialization.json.JsonObject
 import kotlinx.serialization.json.JsonPrimitive
 import kotlinx.serialization.json.add
+import kotlinx.serialization.json.booleanOrNull
 import kotlinx.serialization.json.buildJsonArray
 import kotlinx.serialization.json.buildJsonObject
 import kotlinx.serialization.json.contentOrNull
@@ -22,6 +23,7 @@ import kotlinx.serialization.json.putJsonObject
 /**
  * 远程直接驱动(Direct Drive)的无模型工具会话注册表。
  * 同一时刻只允许一个活动会话，空闲超过 [idleTimeoutMs] 自动关闭回收；
+ * 支持同 owner 且无在途调用(inFlight == 0)时的会话重开/接管(Session Resumption)；
  * 受手机端「允许电脑直接驱动工具」([enabled])开关门控，默认关闭。
  */
 open class McpSessionRegistry(
@@ -46,11 +48,14 @@ open class McpSessionRegistry(
         require(idleTimeoutMs > 0) { "idleTimeoutMs must be positive" }
     }
 
+    data class OpenOutcome(val session: McpToolSession, val resumed: Boolean)
+
     private data class Entry(
         val id: String,
         val session: McpToolSession,
         var lastActiveAtMs: Long,
         val owner: String? = null,
+        val allowedTools: Set<String>? = null,
         var inFlight: Int = 0,
     )
 
@@ -61,19 +66,58 @@ open class McpSessionRegistry(
 
     open fun scope(owner: String): McpSessionRegistry = ScopedMcpSessionRegistry(this, owner)
 
-    open suspend fun open(conversation: String? = null, allowedTools: Set<String>? = null, owner: String? = null): McpToolSession = lock.withLock {
+    open suspend fun open(
+        conversation: String? = null,
+        allowedTools: Set<String>? = null,
+        owner: String? = null,
+        resume: Boolean = false,
+    ): McpToolSession = openWithStatus(conversation, allowedTools, owner, resume).session
+
+    open suspend fun openWithStatus(
+        conversation: String? = null,
+        allowedTools: Set<String>? = null,
+        owner: String? = null,
+        resume: Boolean = false,
+    ): OpenOutcome = lock.withLock {
         ensureEnabledLocked()
         val now = clock()
         expireIdleLocked(now)
+        val requestedThreadId = conversation?.trim()?.takeIf { it.isNotEmpty() }
         active?.let { current ->
-            throw McpTaskTools.ToolError(
-                "A tool session is already open (${current.id}); close it first with $CLOSE."
-            )
+            if (current.owner != owner) {
+                throw McpTaskTools.ToolError(
+                    "A tool session is already open by another client; wait for it to close or expire."
+                )
+            }
+            if (!resume) {
+                throw McpTaskTools.ToolError(
+                    "A tool session is already open (${current.id}); close it first with $CLOSE or pass resume=true."
+                )
+            }
+            if (current.inFlight > 0) {
+                throw McpTaskTools.ToolError(
+                    "Tool session ${current.id} has ${current.inFlight} in-flight tool call(s) and cannot be resumed or replaced right now."
+                )
+            }
+            // Same owner, idle (inFlight == 0), and compatible conversation & tool allowlist -> adopt in-place
+            if ((requestedThreadId == null || requestedThreadId == current.session.spec.threadId) &&
+                current.allowedTools == allowedTools
+            ) {
+                current.lastActiveAtMs = now
+                return@withLock OpenOutcome(current.session, resumed = true)
+            }
+            // Same owner, idle (inFlight == 0), but requested new conversation or tool allowlist -> cleanly replace
+            active = null
+            current.session.close()
+            val replacementThreadId = requestedThreadId ?: current.session.spec.threadId
+            val replacement = server.openToolSession(replacementThreadId, Attendance.Unattended, allowedTools)
+            active = Entry(replacement.spec.id.value, replacement, now, owner, allowedTools)
+            return@withLock OpenOutcome(replacement, resumed = true)
         }
-        val threadId = conversation?.trim()?.takeIf { it.isNotEmpty() } ?: RemoteTaskService.newConversation()
+        val threadId = requestedThreadId ?: RemoteTaskService.newConversation()
         val session = server.openToolSession(threadId, Attendance.Unattended, allowedTools)
-        active = Entry(session.spec.id.value, session, now, owner)
-        session
+        active = Entry(session.spec.id.value, session, now, owner, allowedTools)
+        OpenOutcome(session, resumed = false)
     }
 
     open suspend fun call(sessionId: String, toolName: String, argumentsJson: String, owner: String? = null): JsonObject {
@@ -174,7 +218,8 @@ class McpSessionTools(private val registry: McpSessionRegistry) {
         McpTaskTools.Tool(
             name = McpSessionRegistry.OPEN,
             description = "Open a model-less direct-drive tool session on the phone. Freezes the session tool catalog " +
-                "and returns session_id and tools. Only one tool session can be open at a time.",
+                "and returns session_id and tools. Only one tool session can be open at a time; pass resume=true to adopt " +
+                "or reopen an idle session owned by the same client.",
             schema = buildJsonObject {
                 put("type", "object")
                 putJsonObject("properties") {
@@ -186,6 +231,10 @@ class McpSessionTools(private val registry: McpSessionRegistry) {
                         put("type", "array")
                         putJsonObject("items") { put("type", "string") }
                         put("description", "Optional allowlist of low-level tool names to expose in this session.")
+                    }
+                    putJsonObject("resume") {
+                        put("type", "boolean")
+                        put("description", "Optional: when true, adopt or reopen an existing idle session owned by the same client if inFlight == 0.")
                     }
                 }
                 put("required", buildJsonArray {})
@@ -243,10 +292,13 @@ class McpSessionTools(private val registry: McpSessionRegistry) {
         McpSessionRegistry.OPEN -> {
             val conversation = optString(args, "conversation")
             val filter = optStringSet(args, "tools")
-            val session = registry.open(conversation, filter)
+            val resume = optBoolean(args, "resume") ?: false
+            val outcome = registry.openWithStatus(conversation, filter, resume = resume)
+            val session = outcome.session
             buildJsonObject {
                 put("session_id", session.spec.id.value)
                 put("conversation", session.spec.threadId)
+                put("resumed", outcome.resumed)
                 put("idle_timeout_ms", registry.idleTimeoutMs)
                 putJsonArray("tools") {
                     session.tools().forEach { spec ->
@@ -303,6 +355,13 @@ class McpSessionTools(private val registry: McpSessionRegistry) {
         else -> throw McpTaskTools.ToolError("$key must be a string")
     }
 
+    private fun optBoolean(args: JsonObject, key: String): Boolean? = when (val v = args[key]) {
+        null, JsonNull -> null
+        is JsonPrimitive -> if (v.isString) throw McpTaskTools.ToolError("$key must be a boolean")
+            else v.booleanOrNull ?: throw McpTaskTools.ToolError("$key must be a boolean")
+        else -> throw McpTaskTools.ToolError("$key must be a boolean")
+    }
+
     private fun optStringSet(args: JsonObject, key: String): Set<String>? = when (val v = args[key]) {
         null, JsonNull -> null
         is JsonArray -> v.map { item ->
@@ -326,8 +385,10 @@ private class ScopedMcpSessionRegistry(
     clock = delegate.clock,
 ) {
     override fun scope(owner: String): McpSessionRegistry = delegate.scope(owner)
-    override suspend fun open(conversation: String?, allowedTools: Set<String>?, owner: String?): McpToolSession =
-        delegate.open(conversation, allowedTools, owner = owner ?: this.owner)
+    override suspend fun open(conversation: String?, allowedTools: Set<String>?, owner: String?, resume: Boolean): McpToolSession =
+        delegate.open(conversation, allowedTools, owner = owner ?: this.owner, resume = resume)
+    override suspend fun openWithStatus(conversation: String?, allowedTools: Set<String>?, owner: String?, resume: Boolean): OpenOutcome =
+        delegate.openWithStatus(conversation, allowedTools, owner = owner ?: this.owner, resume = resume)
     override suspend fun call(sessionId: String, toolName: String, argumentsJson: String, owner: String?): JsonObject =
         delegate.call(sessionId, toolName, argumentsJson, owner = owner ?: this.owner)
     override suspend fun close(sessionId: String, owner: String?): Boolean =

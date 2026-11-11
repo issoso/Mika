@@ -10,6 +10,8 @@ import com.wangzan101.mika.core.run.MemoryRunStore
 import com.wangzan101.mika.core.run.RunId
 import com.wangzan101.mika.core.run.RunPhase
 import com.wangzan101.mika.core.tool.FakeScreen
+import kotlinx.coroutines.CompletableDeferred
+import kotlinx.coroutines.async
 import kotlinx.serialization.json.Json
 import kotlinx.serialization.json.JsonObject
 import kotlinx.serialization.json.JsonPrimitive
@@ -20,6 +22,7 @@ import kotlinx.serialization.json.jsonObject
 import kotlinx.serialization.json.jsonPrimitive
 import org.junit.Assert.assertEquals
 import org.junit.Assert.assertFalse
+import org.junit.Assert.assertNotEquals
 import org.junit.Assert.assertTrue
 import org.junit.Test
 import java.net.InetAddress
@@ -27,10 +30,11 @@ import java.net.InetAddress
 class McpDirectDriveTest {
     private var nowMs = 1_000L
     private var directDriveEnabled = true
+    private var commandHook: (suspend (String) -> CommandResult)? = null
     private val store = MemoryRunStore()
     private val sandbox = object : SandboxPort {
-        override suspend fun runCommand(command: String, timeoutSeconds: Int) =
-            CommandResult(0, "ran:$command", "")
+        override suspend fun runCommand(command: String, timeoutSeconds: Int): CommandResult =
+            commandHook?.invoke(command) ?: CommandResult(0, "ran:$command", "")
     }
     private val server = McpServer(
         assemble = { spec -> toolDispatcher(FakeScreen(), sandbox = sandbox, runSpec = spec) },
@@ -99,6 +103,7 @@ class McpDirectDriveTest {
         assertFalse(openErr)
         val sessionId = opened.getValue("session_id").jsonPrimitive.content
         assertEquals("mcp-direct-1", opened.getValue("conversation").jsonPrimitive.content)
+        assertFalse(opened.getValue("resumed").jsonPrimitive.boolean)
         val toolNames = opened.getValue("tools").jsonArray
             .map { it.jsonObject.getValue("name").jsonPrimitive.content }.toSet()
         assertEquals(setOf("run_command", "phone_observe"), toolNames)
@@ -155,6 +160,81 @@ class McpDirectDriveTest {
         assertFalse(err3)
         val id3 = third.getValue("session_id").jsonPrimitive.content
         callTool("mika_close_tool_session", """{"session_id":"$id3"}""")
+    }
+
+    @Test
+    fun sameOwnerCanResumeIdleSessionOrReplaceWhenConfigChangesAndRejectsWhenInFlight() = kotlinx.coroutines.runBlocking {
+        val clientA = registry.scope("client-a")
+        val clientB = registry.scope("client-b")
+
+        // 1. Open initial session for client A
+        val first = clientA.openWithStatus(conversation = "mcp-conv-a", allowedTools = setOf("run_command"))
+        assertFalse(first.resumed)
+        val id1 = first.session.spec.id.value
+
+        // 2. Resuming with identical owner, idle (inFlight == 0), and compatible parameters adopts the same session in-place
+        nowMs += 10_000L
+        val adopted = clientA.openWithStatus(resume = true, allowedTools = setOf("run_command"))
+        assertTrue(adopted.resumed)
+        assertEquals(id1, adopted.session.spec.id.value)
+        assertEquals("mcp-conv-a", adopted.session.spec.threadId)
+
+        // 3. Unscoped RPC cannot see or hijack clientA's sessionId
+        val (rpcOpenErr, rpcOpened) = callTool("mika_open_tool_session", """{"conversation":"mcp-rpc-1"}""")
+        assertTrue(rpcOpenErr)
+        assertFalse(rpcOpened.getValue("error").jsonPrimitive.content.contains(id1))
+
+        // 4. Different owner cannot resume client A's session and never leaks session_id
+        var bResumeFailed = false
+        try {
+            clientB.open(resume = true)
+        } catch (e: McpTaskTools.ToolError) {
+            bResumeFailed = true
+            assertFalse(e.message.orEmpty().contains(id1))
+            assertTrue(e.message.orEmpty().contains("another client"))
+        }
+        assertTrue(bResumeFailed)
+
+        // 5. Same owner with resume=true and a new tool allowlist replaces the old idle session cleanly
+        val replaced = clientA.openWithStatus(
+            conversation = "mcp-conv-a2",
+            allowedTools = setOf("run_command", "phone_observe"),
+            resume = true,
+        )
+        assertTrue(replaced.resumed)
+        val id2 = replaced.session.spec.id.value
+        assertNotEquals(id1, id2)
+        assertEquals(RunPhase.Ended, store.get(RunId(id1))?.phase)
+        assertEquals("mcp-conv-a2", replaced.session.spec.threadId)
+
+        // 6. While a tool call is in-flight (inFlight > 0), even the same owner with resume=true cannot replace/resume it
+        val started = CompletableDeferred<Unit>()
+        val release = CompletableDeferred<Unit>()
+        commandHook = { cmd ->
+            started.complete(Unit)
+            release.await()
+            CommandResult(0, "done:$cmd", "")
+        }
+        val inFlightJob = async {
+            clientA.call(id2, "run_command", """{"command":"sleep 1"}""")
+        }
+        started.await()
+
+        var inFlightResumeFailed = false
+        try {
+            clientA.open(resume = true)
+        } catch (e: McpTaskTools.ToolError) {
+            inFlightResumeFailed = true
+            assertTrue(e.message.orEmpty().contains("in-flight"))
+        } finally {
+            release.complete(Unit)
+            commandHook = null
+        }
+        assertTrue(inFlightResumeFailed)
+        val callResult = inFlightJob.await()
+        assertEquals("done:sleep 1", callResult.getValue("stdout").jsonPrimitive.content)
+
+        assertTrue(clientA.close(id2))
     }
 
     @Test
@@ -264,6 +344,16 @@ class McpDirectDriveTest {
 
         val sessionA = clientA.open()
         val sessionId = sessionA.spec.id.value
+
+        var bOpenFailed = false
+        try {
+            clientB.open()
+        } catch (e: McpTaskTools.ToolError) {
+            bOpenFailed = true
+            assertFalse(e.message.orEmpty().contains(sessionId))
+            assertTrue(e.message?.contains("another client") == true)
+        }
+        assertTrue(bOpenFailed)
 
         var bCallFailed = false
         try {
